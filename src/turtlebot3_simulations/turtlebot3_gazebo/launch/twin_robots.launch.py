@@ -2,8 +2,13 @@ import os
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import IncludeLaunchDescription, AppendEnvironmentVariable
+from launch.actions import (
+    AppendEnvironmentVariable,
+    DeclareLaunchArgument,
+    IncludeLaunchDescription,
+)
 from launch.launch_description_sources import PythonLaunchDescriptionSource
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 
 
@@ -11,7 +16,17 @@ def generate_launch_description():
     ros_gz_sim = get_package_share_directory('ros_gz_sim')
     pkg_turtlebot3_gazebo = get_package_share_directory('turtlebot3_gazebo')
 
-    world = os.path.join(pkg_turtlebot3_gazebo, 'worlds', 'empty_world.world')
+    world_arg = DeclareLaunchArgument(
+        'world',
+        default_value='empty_world.world',
+        description='World file name inside turtlebot3_gazebo/worlds/'
+    )
+
+    world = PathJoinSubstitution([
+        pkg_turtlebot3_gazebo,
+        'worlds',
+        LaunchConfiguration('world'),
+    ])
 
     # Gazebo Server & Client
     gzserver_cmd = IncludeLaunchDescription(
@@ -60,6 +75,7 @@ def generate_launch_description():
     )
 
     ld = LaunchDescription()
+    ld.add_action(world_arg)
     ld.add_action(gzserver_cmd)
     ld.add_action(gzclient_cmd)
     ld.add_action(set_env_vars_resources)

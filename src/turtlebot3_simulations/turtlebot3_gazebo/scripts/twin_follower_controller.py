@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+from collections import deque
 import csv
 import math
 import os
@@ -42,6 +43,7 @@ class TwinFollowerController(Node):
         # PARAMETERS
         # =========================
 
+        self.declare_parameter('robot_name', 'follower')
         self.declare_parameter('target_topic', '/follower/target')
         self.declare_parameter('odom_topic', '/follower/odom')
         self.declare_parameter('cmd_topic', '/follower/cmd_vel')
@@ -62,6 +64,14 @@ class TwinFollowerController(Node):
         self.declare_parameter('target_timeout', 0.50)
         self.declare_parameter('max_steering_angle_deg', 60.0)
 
+        # Local breadcrumb Pure Pursuit parameters (zero inter-robot comms)
+        self.declare_parameter('use_breadcrumbs', True)
+        self.declare_parameter('waypoint_spacing', 0.05)
+        self.declare_parameter('lookahead_distance', 0.16)
+        self.declare_parameter('waypoint_reach_radius', 0.10)
+        self.declare_parameter('max_breadcrumbs', 200)
+
+        self.robot_name = self.get_parameter('robot_name').value
         self.target_topic = self.get_parameter('target_topic').value
         self.odom_topic = self.get_parameter('odom_topic').value
         self.cmd_topic = self.get_parameter('cmd_topic').value
@@ -90,6 +100,14 @@ class TwinFollowerController(Node):
             self.get_parameter('max_steering_angle_deg').value
         )
 
+        self.use_breadcrumbs = self.get_parameter('use_breadcrumbs').value
+        self.waypoint_spacing = self.get_parameter('waypoint_spacing').value
+        self.lookahead_distance = self.get_parameter('lookahead_distance').value
+        self.waypoint_reach_radius = self.get_parameter(
+            'waypoint_reach_radius'
+        ).value
+        self.max_breadcrumbs = self.get_parameter('max_breadcrumbs').value
+
         # =========================
         # STATE
         # =========================
@@ -100,12 +118,15 @@ class TwinFollowerController(Node):
         self.previous_distance_error = None
         self.previous_angle_error = None
 
+        self.odom_received = False
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_yaw = 0.0
 
         self.actual_linear_velocity = 0.0
         self.actual_angular_velocity = 0.0
+
+        self.breadcrumbs = deque(maxlen=self.max_breadcrumbs)
 
         # =========================
         # ROS INTERFACES
@@ -147,7 +168,7 @@ class TwinFollowerController(Node):
         os.makedirs(log_directory, exist_ok=True)
 
         filename = time.strftime(
-            'twin_run_%Y%m%d_%H%M%S.csv'
+            f'twin_run_{self.robot_name}_%Y%m%d_%H%M%S.csv'
         )
 
         self.log_path = os.path.join(
@@ -191,7 +212,11 @@ class TwinFollowerController(Node):
             'robot_yaw',
 
             'actual_linear_velocity',
-            'actual_angular_velocity'
+            'actual_angular_velocity',
+
+            'num_breadcrumbs',
+            'lookahead_x',
+            'lookahead_y'
         ])
 
         self.start_time = self.get_clock().now().nanoseconds / 1e9
@@ -205,7 +230,9 @@ class TwinFollowerController(Node):
             f'Kp_linear={self.kp_linear}, '
             f'Kd_linear={self.kd_linear}, '
             f'Kp_angular={self.kp_angular}, '
-            f'Kd_angular={self.kd_angular}'
+            f'Kd_angular={self.kd_angular}, '
+            f'use_breadcrumbs={self.use_breadcrumbs}, '
+            f'lookahead={self.lookahead_distance:.2f}m'
         )
 
     def odom_callback(self, msg):
@@ -222,6 +249,64 @@ class TwinFollowerController(Node):
 
         self.actual_linear_velocity = msg.twist.twist.linear.x
         self.actual_angular_velocity = msg.twist.twist.angular.z
+        self.odom_received = True
+
+    def update_breadcrumbs(self, distance, target_angle):
+
+        # Project leader observation into follower's own local odometry frame
+        world_angle = self.robot_yaw + target_angle
+        leader_x = self.robot_x + distance * math.cos(world_angle)
+        leader_y = self.robot_y + distance * math.sin(world_angle)
+
+        if not self.breadcrumbs:
+            self.breadcrumbs.append((leader_x, leader_y))
+        else:
+            last_x, last_y = self.breadcrumbs[-1]
+            if math.hypot(leader_x - last_x, leader_y - last_y) >= self.waypoint_spacing:
+                self.breadcrumbs.append((leader_x, leader_y))
+
+        # Prune waypoints that have been reached or passed behind the robot
+        cos_yaw = math.cos(self.robot_yaw)
+        sin_yaw = math.sin(self.robot_yaw)
+
+        while len(self.breadcrumbs) > 1:
+            wx, wy = self.breadcrumbs[0]
+            dx = wx - self.robot_x
+            dy = wy - self.robot_y
+            dist = math.hypot(dx, dy)
+            forward = dx * cos_yaw + dy * sin_yaw
+
+            if dist < self.waypoint_reach_radius or forward < 0.0:
+                self.breadcrumbs.popleft()
+            else:
+                break
+
+    def get_lookahead_point(self):
+
+        points = list(self.breadcrumbs)
+        gx, gy = points[-1]
+
+        for i, (wx, wy) in enumerate(points):
+            dist = math.hypot(wx - self.robot_x, wy - self.robot_y)
+            if dist >= self.lookahead_distance:
+                if i == 0:
+                    gx, gy = wx, wy
+                else:
+                    # Interpolate along segment [i-1, i] to the lookahead circle
+                    px, py = points[i - 1]
+                    d_prev = math.hypot(px - self.robot_x, py - self.robot_y)
+                    denom = max(dist - d_prev, 1e-6)
+                    t = max(0.0, min(1.0, (self.lookahead_distance - d_prev) / denom))
+                    gx = px + t * (wx - px)
+                    gy = py + t * (wy - py)
+                break
+
+        dx = gx - self.robot_x
+        dy = gy - self.robot_y
+        lookahead_dist = math.hypot(dx, dy)
+        alpha = normalize_angle(math.atan2(dy, dx) - self.robot_yaw)
+
+        return gx, gy, lookahead_dist, alpha
 
     def publish_zero(self):
 
@@ -247,6 +332,7 @@ class TwinFollowerController(Node):
             self.previous_time = None
             self.previous_distance_error = None
             self.previous_angle_error = None
+            self.breadcrumbs.clear()
 
     def target_callback(self, msg):
 
@@ -273,7 +359,17 @@ class TwinFollowerController(Node):
         self.last_target_time = now
 
         distance_error = distance - self.target_distance
-        angle_error = normalize_angle(target_angle)
+
+        if self.use_breadcrumbs and self.odom_received:
+            self.update_breadcrumbs(distance, target_angle)
+            lookahead_x, lookahead_y, lookahead_dist, angle_error = (
+                self.get_lookahead_point()
+            )
+        else:
+            lookahead_x = float('nan')
+            lookahead_y = float('nan')
+            lookahead_dist = distance
+            angle_error = normalize_angle(target_angle)
 
         if self.previous_time is None:
             self.previous_time = now
@@ -304,20 +400,60 @@ class TwinFollowerController(Node):
             self.max_linear_velocity
         )
 
-        angular_p = self.kp_angular * angle_error
-        angular_d = self.kd_angular * angle_derivative
+        if self.use_breadcrumbs and self.odom_received:
+            angular_p = 0.0
+            angular_d = 0.0
 
-        angular_raw = angular_p + angular_d
+            if abs(angle_error) > self.max_steering_angle:
+                linear_velocity = 0.0
+                angular_raw = self.kp_angular * angle_error
+                angular_velocity = self.angular_sign * saturate(
+                    angular_raw,
+                    self.max_angular_velocity
+                )
+            else:
+                linear_velocity *= max(0.0, math.cos(angle_error))
 
-        angular_velocity = self.angular_sign * saturate(
-            angular_raw,
-            self.max_angular_velocity
-        )
-
-        if abs(angle_error) > self.max_steering_angle:
-            linear_velocity = 0.0
+                if linear_velocity > 0.02:
+                    # Pure Pursuit: omega = v * 2 * sin(alpha) / L_d
+                    curvature = (
+                        2.0 * math.sin(angle_error)
+                        / max(lookahead_dist, 0.05)
+                    )
+                    angular_raw = linear_velocity * curvature
+                    angular_velocity = self.angular_sign * saturate(
+                        angular_raw,
+                        self.max_angular_velocity
+                    )
+                elif abs(linear_velocity) <= 0.02:
+                    if abs(angle_error) > 0.35:
+                        angular_raw = 0.5 * self.kp_angular * angle_error
+                        angular_velocity = self.angular_sign * saturate(
+                            angular_raw,
+                            self.max_angular_velocity
+                        )
+                    else:
+                        angular_raw = 0.0
+                        angular_velocity = 0.0
+                else:
+                    # Reversing: back straight away safely
+                    angular_raw = 0.0
+                    angular_velocity = 0.0
         else:
-            linear_velocity *= max(0.0, math.cos(angle_error))
+            angular_p = self.kp_angular * angle_error
+            angular_d = self.kd_angular * angle_derivative
+
+            angular_raw = angular_p + angular_d
+
+            angular_velocity = self.angular_sign * saturate(
+                angular_raw,
+                self.max_angular_velocity
+            )
+
+            if abs(angle_error) > self.max_steering_angle:
+                linear_velocity = 0.0
+            else:
+                linear_velocity *= max(0.0, math.cos(angle_error))
 
         command = TwistStamped()
         command.header.stamp = self.get_clock().now().to_msg()
@@ -357,7 +493,11 @@ class TwinFollowerController(Node):
             self.robot_yaw,
 
             self.actual_linear_velocity,
-            self.actual_angular_velocity
+            self.actual_angular_velocity,
+
+            len(self.breadcrumbs),
+            lookahead_x,
+            lookahead_y
         ])
 
         self.log_file.flush()
@@ -365,7 +505,8 @@ class TwinFollowerController(Node):
         print(
             f't={elapsed_time:7.2f}s | '
             f'd={distance:.3f}m | '
-            f'ang={math.degrees(angle_error):+6.1f}deg | '
+            f'alpha={math.degrees(angle_error):+6.1f}deg | '
+            f'wp={len(self.breadcrumbs):2d} | '
             f'v={linear_velocity:+.3f}m/s | '
             f'w={angular_velocity:+.3f}rad/s'
         )

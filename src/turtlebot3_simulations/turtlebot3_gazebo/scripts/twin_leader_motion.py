@@ -42,6 +42,7 @@ class TwinLeaderMotion(Node):
             (6.0, self.linear_speed, self.angular_speed),
             (4.0, self.linear_speed, 0.0),
             (6.0, self.linear_speed, -self.angular_speed),
+            (8.0, self.linear_speed, 0.0),
             (3.0, 0.0, 0.0),
         ]
 
@@ -101,10 +102,14 @@ class TwinLeaderMotion(Node):
         elapsed = now - self.segment_start_time
 
         if elapsed >= duration:
-
             self.segment_index += 1
-            self.segment_start_time = now
-            return
+            self.segment_start_time += duration
+            if self.segment_index >= len(self.segments):
+                return
+            duration, linear_velocity, angular_velocity = (
+                self.segments[self.segment_index]
+            )
+            elapsed = now - self.segment_start_time
 
         self.publish_velocity(linear_velocity, angular_velocity)
 
